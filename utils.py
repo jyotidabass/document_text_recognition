@@ -3,161 +3,82 @@
 # This program is licensed under the Apache License version 2.
 # See LICENSE or go to <https://www.apache.org/licenses/LICENSE-2.0.txt> for full license details.
 
-import string
-import unicodedata
-from collections.abc import Sequence
-from functools import partial
-from typing import Any, Dict, List, Optional
-from typing import Sequence as SequenceType
-from typing import Tuple, TypeVar, Union
+from typing import List
 
-import numpy as np
+from rapidfuzz.string_metric import levenshtein
 
-from doctr.io.image import get_img_shape
-from doctr.utils.geometry import convert_to_relative_coords
-
-from .vocabs import VOCABS
-
-__all__ = ['translate', 'encode_string', 'decode_sequence', 'encode_sequences']
-
-ImageTensor = TypeVar('ImageTensor')
+__all__ = ['merge_strings', 'merge_multi_strings']
 
 
-def translate(
-    input_string: str,
-    vocab_name: str,
-    unknown_char: str = '■',
-) -> str:
-    """Translate a string input in a given vocabulary
+def merge_strings(a: str, b: str, dil_factor: float) -> str:
+    """Merges 2 character sequences in the best way to maximize the alignment of their overlapping characters.
 
     Args:
-        input_string: input string to translate
-        vocab_name: vocabulary to use (french, latin, ...)
-        unknown_char: unknown character for non-translatable characters
+        a: first char seq, suffix should be similar to b's prefix.
+        b: second char seq, prefix should be similar to a's suffix.
+        dil_factor: dilation factor of the boxes to overlap, should be > 1. This parameter is
+            only used when the mother sequence is splitted on a character repetition
 
     Returns:
-        A string translated in a given vocab"""
+        A merged character sequence.
 
-    if VOCABS.get(vocab_name) is None:
-        raise KeyError("output vocabulary must be in vocabs dictionnary")
-
-    translated = ''
-    for char in input_string:
-        if char not in VOCABS[vocab_name]:
-            # we need to translate char into a vocab char
-            if char in string.whitespace:
-                # remove whitespaces
-                continue
-            # normalize character if it is not in vocab
-            char = unicodedata.normalize('NFD', char).encode('ascii', 'ignore').decode('ascii')
-            if char == '' or char not in VOCABS[vocab_name]:
-                # if normalization fails or char still not in vocab, return unknown character)
-                char = unknown_char
-        translated += char
-    return translated
-
-
-def encode_string(
-    input_string: str,
-    vocab: str,
-) -> List[int]:
-    """Given a predefined mapping, encode the string to a sequence of numbers
-
-    Args:
-        input_string: string to encode
-        vocab: vocabulary (string), the encoding is given by the indexing of the character sequence
-
-    Returns:
-        A list encoding the input_string"""
-
-    return list(map(vocab.index, input_string))  # type: ignore[arg-type]
-
-
-def decode_sequence(
-    input_seq: Union[np.array, SequenceType[int]],
-    mapping: str,
-) -> str:
-    """Given a predefined mapping, decode the sequence of numbers to a string
-
-    Args:
-        input_seq: array to decode
-        mapping: vocabulary (string), the encoding is given by the indexing of the character sequence
-
-    Returns:
-        A string, decoded from input_seq
+    Example::
+        >>> from doctr.model.recognition.utils import merge_sequences
+        >>> merge_sequences('abcd', 'cdefgh', 1.4)
+        'abcdefgh'
+        >>> merge_sequences('abcdi', 'cdefgh', 1.4)
+        'abcdefgh'
     """
+    seq_len = min(len(a), len(b))
+    if seq_len == 0:  # One sequence is empty, return the other
+        return b if len(a) == 0 else b
 
-    if not isinstance(input_seq, (Sequence, np.ndarray)):
-        raise TypeError("Invalid sequence type")
-    if isinstance(input_seq, np.ndarray) and (input_seq.dtype != np.int_ or input_seq.max() >= len(mapping)):
-        raise AssertionError("Input must be an array of int, with max less than mapping size")
+    # Initialize merging index and corresponding score (mean Levenstein)
+    min_score, index = 1., 0  # No overlap, just concatenate
 
-    return ''.join(map(mapping.__getitem__, input_seq))
+    scores = [levenshtein(a[-i:], b[:i], processor=None) / i for i in range(1, seq_len + 1)]
+
+    # Edge case (split in the middle of char repetitions): if it starts with 2 or more 0
+    if len(scores) > 1 and (scores[0], scores[1]) == (0, 0):
+        # Compute n_overlap (number of overlapping chars, geometrically determined)
+        n_overlap = round(len(b) * (dil_factor - 1) / dil_factor)
+        # Find the number of consecutive zeros in the scores list
+        # Impossible to have a zero after a non-zero score in that case
+        n_zeros = sum(val == 0 for val in scores)
+        # Index is bounded by the geometrical overlap to avoid collapsing repetitions
+        min_score, index = 0, min(n_zeros, n_overlap)
+
+    else:  # Common case: choose the min score index
+        for i, score in enumerate(scores):
+            if score < min_score:
+                min_score, index = score, i + 1  # Add one because first index is an overlap of 1 char
+
+    # Merge with correct overlap
+    if index == 0:
+        return a + b
+    return a[:-1] + b[index - 1:]
 
 
-def encode_sequences(
-    sequences: List[str],
-    vocab: str,
-    target_size: Optional[int] = None,
-    eos: int = -1,
-    sos: Optional[int] = None,
-    pad: Optional[int] = None,
-    dynamic_seq_length: bool = False,
-    **kwargs: Any,
-) -> np.ndarray:
-    """Encode character sequences using a given vocab as mapping
+def merge_multi_strings(seq_list: List[str], dil_factor: float) -> str:
+    """Recursively merges consecutive string sequences with overlapping characters.
 
     Args:
-        sequences: the list of character sequences of size N
-        vocab: the ordered vocab to use for encoding
-        target_size: maximum length of the encoded data
-        eos: encoding of End Of String
-        sos: optional encoding of Start Of String
-        pad: optional encoding for padding. In case of padding, all sequences are followed by 1 EOS then PAD
-        dynamic_seq_length: if `target_size` is specified, uses it as upper bound and enables dynamic sequence size
+        seq_list: list of sequences to merge. Sequences need to be ordered from left to right.
+        dil_factor: dilation factor of the boxes to overlap, should be > 1. This parameter is
+            only used when the mother sequence is splitted on a character repetition
 
     Returns:
-        the padded encoded data as a tensor
+        A merged character sequence
+
+    Example::
+        >>> from doctr.model.recognition.utils import merge_multi_sequences
+        >>> merge_multi_sequences(['abc', 'bcdef', 'difghi', 'aijkl'], 1.4)
+        'abcdefghijkl'
     """
+    def _recursive_merge(a: str, seq_list: List[str], dil_factor: float) -> str:
+        # Recursive version of compute_overlap
+        if len(seq_list) == 1:
+            return merge_strings(a, seq_list[0], dil_factor)
+        return _recursive_merge(merge_strings(a, seq_list[0], dil_factor), seq_list[1:], dil_factor)
 
-    if 0 <= eos < len(vocab):
-        raise ValueError("argument 'eos' needs to be outside of vocab possible indices")
-
-    if not isinstance(target_size, int) or dynamic_seq_length:
-        # Maximum string length + EOS
-        max_length = max(len(w) for w in sequences) + 1
-        if isinstance(sos, int):
-            max_length += 1
-        if isinstance(pad, int):
-            max_length += 1
-        target_size = max_length if not isinstance(target_size, int) else min(max_length, target_size)
-
-    # Pad all sequences
-    if isinstance(pad, int):  # pad with padding symbol
-        if 0 <= pad < len(vocab):
-            raise ValueError("argument 'pad' needs to be outside of vocab possible indices")
-        # In that case, add EOS at the end of the word before padding
-        default_symbol = pad
-    else:  # pad with eos symbol
-        default_symbol = eos
-    encoded_data = np.full([len(sequences), target_size], default_symbol, dtype=np.int32)
-
-    # Encode the strings
-    for idx, seq in enumerate(map(partial(encode_string, vocab=vocab), sequences)):
-        if isinstance(pad, int):  # add eos at the end of the sequence
-            seq.append(eos)
-        encoded_data[idx, :min(len(seq), target_size)] = seq[:min(len(seq), target_size)]
-
-    if isinstance(sos, int):  # place sos symbol at the beginning of each sequence
-        if 0 <= sos < len(vocab):
-            raise ValueError("argument 'sos' needs to be outside of vocab possible indices")
-        encoded_data = np.roll(encoded_data, 1)
-        encoded_data[:, 0] = sos
-
-    return encoded_data
-
-
-def convert_target_to_relative(img: ImageTensor, target: Dict[str, Any]) -> Tuple[ImageTensor, Dict[str, Any]]:
-
-    target['boxes'] = convert_to_relative_coords(target['boxes'], get_img_shape(img))
-    return img, target
+    return _recursive_merge("", seq_list, dil_factor)
