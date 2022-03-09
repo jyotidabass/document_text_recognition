@@ -12,46 +12,55 @@ import os
 import time
 
 import numpy as np
-import torch
+import tensorflow as tf
 
-os.environ['USE_TORCH'] = '1'
+os.environ['USE_TF'] = '1'
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 from doctr.models import recognition
 
 
-@torch.no_grad()
 def main(args):
 
-    device = torch.device("cuda:0" if args.gpu else "cpu")
+    if args.gpu:
+        gpu_devices = tf.config.experimental.list_physical_devices('GPU')
+        if any(gpu_devices):
+            tf.config.experimental.set_memory_growth(gpu_devices[0], True)
+        else:
+            raise AssertionError("TensorFlow cannot access your GPU. Please investigate!")
+    else:
+        os.environ['CUDA_VISIBLE_DEVICES'] = ""
 
+    spatial_shape = (args.size, 4 * args.size)
     # Pretrained imagenet model
     model = recognition.__dict__[args.arch](
         pretrained=args.pretrained,
         pretrained_backbone=False,
-    ).eval().to(device=device)
+        input_shape=(*spatial_shape, 3),
+    )
 
     # Input
-    img_tensor = torch.rand((args.batch_size, 3, args.size, 4 * args.size)).to(device=device)
+    img_tensor = tf.random.uniform(shape=[args.batch_size, *spatial_shape, 3], maxval=1, dtype=tf.float32)
 
     # Warmup
     for _ in range(10):
-        _ = model(img_tensor)
+        _ = model(img_tensor, training=False)
 
     timings = []
 
     # Evaluation runs
     for _ in range(args.it):
         start_ts = time.perf_counter()
-        _ = model(img_tensor)
+        _ = model(img_tensor, training=False)
         timings.append(time.perf_counter() - start_ts)
 
     _timings = np.array(timings)
-    print(f"{args.arch} ({args.it} runs on ({args.size}, {4 * args.size}) inputs in batches of {args.batch_size})")
+    print(f"{args.arch} ({args.it} runs on {spatial_shape} inputs in batches of {args.batch_size})")
     print(f"mean {1000 * _timings.mean():.2f}ms, std {1000 * _timings.std():.2f}ms")
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='docTR latency benchmark for text recognition (PyTorch)',
+    parser = argparse.ArgumentParser(description='docTR latency benchmark for text recognition (TensorFlow)',
                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("arch", type=str, help="Architecture to use")
     parser.add_argument("--batch-size", "-b", type=int, default=64, help="The batch_size")

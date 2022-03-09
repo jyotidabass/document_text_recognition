@@ -3,82 +3,71 @@
 # This program is licensed under the Apache License version 2.
 # See LICENSE or go to <https://www.apache.org/licenses/LICENSE-2.0.txt> for full license details.
 
-from typing import List
+import math
 
-from rapidfuzz.string_metric import levenshtein
-
-__all__ = ['merge_strings', 'merge_multi_strings']
-
-
-def merge_strings(a: str, b: str, dil_factor: float) -> str:
-    """Merges 2 character sequences in the best way to maximize the alignment of their overlapping characters.
-
-    Args:
-        a: first char seq, suffix should be similar to b's prefix.
-        b: second char seq, prefix should be similar to a's suffix.
-        dil_factor: dilation factor of the boxes to overlap, should be > 1. This parameter is
-            only used when the mother sequence is splitted on a character repetition
-
-    Returns:
-        A merged character sequence.
-
-    Example::
-        >>> from doctr.model.recognition.utils import merge_sequences
-        >>> merge_sequences('abcd', 'cdefgh', 1.4)
-        'abcdefgh'
-        >>> merge_sequences('abcdi', 'cdefgh', 1.4)
-        'abcdefgh'
-    """
-    seq_len = min(len(a), len(b))
-    if seq_len == 0:  # One sequence is empty, return the other
-        return b if len(a) == 0 else b
-
-    # Initialize merging index and corresponding score (mean Levenstein)
-    min_score, index = 1., 0  # No overlap, just concatenate
-
-    scores = [levenshtein(a[-i:], b[:i], processor=None) / i for i in range(1, seq_len + 1)]
-
-    # Edge case (split in the middle of char repetitions): if it starts with 2 or more 0
-    if len(scores) > 1 and (scores[0], scores[1]) == (0, 0):
-        # Compute n_overlap (number of overlapping chars, geometrically determined)
-        n_overlap = round(len(b) * (dil_factor - 1) / dil_factor)
-        # Find the number of consecutive zeros in the scores list
-        # Impossible to have a zero after a non-zero score in that case
-        n_zeros = sum(val == 0 for val in scores)
-        # Index is bounded by the geometrical overlap to avoid collapsing repetitions
-        min_score, index = 0, min(n_zeros, n_overlap)
-
-    else:  # Common case: choose the min score index
-        for i, score in enumerate(scores):
-            if score < min_score:
-                min_score, index = score, i + 1  # Add one because first index is an overlap of 1 char
-
-    # Merge with correct overlap
-    if index == 0:
-        return a + b
-    return a[:-1] + b[index - 1:]
+import matplotlib.pyplot as plt
+import numpy as np
 
 
-def merge_multi_strings(seq_list: List[str], dil_factor: float) -> str:
-    """Recursively merges consecutive string sequences with overlapping characters.
+def plot_samples(images, targets):
+    # Unnormalize image
+    num_samples = min(len(images), 12)
+    num_cols = min(len(images), 4)
+    num_rows = int(math.ceil(num_samples / num_cols))
+    _, axes = plt.subplots(num_rows, num_cols, figsize=(20, 5))
+    for idx in range(num_samples):
+        img = (255 * images[idx].numpy()).round().clip(0, 255).astype(np.uint8)
+        if img.shape[0] == 3 and img.shape[2] != 3:
+            img = img.transpose(1, 2, 0)
+
+        row_idx = idx // num_cols
+        col_idx = idx % num_cols
+        ax = axes[row_idx] if num_rows > 1 else axes
+        ax = ax[col_idx] if num_cols > 1 else ax
+
+        ax.imshow(img)
+        ax.set_title(targets[idx])
+    # Disable axis
+    for ax in axes.ravel():
+        ax.axis('off')
+
+    plt.show()
+
+
+def plot_recorder(lr_recorder, loss_recorder, beta: float = 0.95, **kwargs) -> None:
+    """Display the results of the LR grid search.
+    Adapted from https://github.com/frgfm/Holocron/blob/master/holocron/trainer/core.py.
 
     Args:
-        seq_list: list of sequences to merge. Sequences need to be ordered from left to right.
-        dil_factor: dilation factor of the boxes to overlap, should be > 1. This parameter is
-            only used when the mother sequence is splitted on a character repetition
-
-    Returns:
-        A merged character sequence
-
-    Example::
-        >>> from doctr.model.recognition.utils import merge_multi_sequences
-        >>> merge_multi_sequences(['abc', 'bcdef', 'difghi', 'aijkl'], 1.4)
-        'abcdefghijkl'
+        lr_recorder: list of LR values
+        loss_recorder: list of loss values
+        beta (float, optional): smoothing factor
     """
-    def _recursive_merge(a: str, seq_list: List[str], dil_factor: float) -> str:
-        # Recursive version of compute_overlap
-        if len(seq_list) == 1:
-            return merge_strings(a, seq_list[0], dil_factor)
-        return _recursive_merge(merge_strings(a, seq_list[0], dil_factor), seq_list[1:], dil_factor)
 
-    return _recursive_merge("", seq_list, dil_factor)
+    if len(lr_recorder) != len(loss_recorder) or len(lr_recorder) == 0:
+        raise AssertionError("Both `lr_recorder` and `loss_recorder` should have the same length")
+
+    # Exp moving average of loss
+    smoothed_losses = []
+    avg_loss = 0.
+    for idx, loss in enumerate(loss_recorder):
+        avg_loss = beta * avg_loss + (1 - beta) * loss
+        smoothed_losses.append(avg_loss / (1 - beta ** (idx + 1)))
+
+    # Properly rescale Y-axis
+    data_slice = slice(
+        min(len(loss_recorder) // 10, 10),
+        -min(len(loss_recorder) // 20, 5) if len(loss_recorder) >= 20 else len(loss_recorder)
+    )
+    vals = np.array(smoothed_losses[data_slice])
+    min_idx = vals.argmin()
+    max_val = vals.max() if min_idx is None else vals[:min_idx + 1].max()  # type: ignore[misc]
+    delta = max_val - vals[min_idx]
+
+    plt.plot(lr_recorder[data_slice], smoothed_losses[data_slice])
+    plt.xscale('log')
+    plt.xlabel('Learning Rate')
+    plt.ylabel('Training loss')
+    plt.ylim(vals[min_idx] - 0.1 * delta, max_val + 0.2 * delta)
+    plt.grid(True, linestyle='--', axis='x')
+    plt.show(**kwargs)
